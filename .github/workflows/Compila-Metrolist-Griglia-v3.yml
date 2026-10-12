@@ -1,0 +1,134 @@
+name: Compila Metrolist Griglia per Android Auto V3
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Compilazione APK prova
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Scarica codice del progetto
+        uses: actions/checkout@v4
+      - name: Installa Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Configura Android SDK (senza pacchetto tools obsoleto)
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+      - name: Installa API 37 e Build Tools 36
+        shell: bash
+        run: |
+          sdkmanager --install 'platforms;android-37.0' 'build-tools;36.0.0'
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ -d "$SDK_ROOT/platforms/android-37.0" ] && [ ! -e "$SDK_ROOT/platforms/android-37" ]; then
+            ln -s android-37.0 "$SDK_ROOT/platforms/android-37"
+          fi
+      - name: Prepara Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Crea chiave di firma APK di prova
+        shell: bash
+        run: |
+          # La configurazione Gradle di Metrolist richiede questo file per i build debug.
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair \
+              -keystore "$HOME/.android/debug.keystore" \
+              -alias androiddebugkey \
+              -storepass android \
+              -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Metrolist Grid Test,C=IT" \
+              -noprompt
+          fi
+          test -s "$HOME/.android/debug.keystore"
+      - name: Applica la modifica alle griglie
+        shell: bash
+        run: |
+          cat > /tmp/metrolist-grid.patch <<'METROLIST_GRID_PATCH'
+          --- a/app/src/main/kotlin/com/metrolist/music/playback/MediaLibrarySessionCallback.kt
+          +++ b/app/src/main/kotlin/com/metrolist/music/playback/MediaLibrarySessionCallback.kt
+          @@ -14,6 +14,7 @@
+           import androidx.media3.common.C
+           import androidx.media3.common.MediaItem
+           import androidx.media3.common.MediaMetadata
+          +import androidx.media3.common.util.UnstableApi
+           import androidx.media3.exoplayer.offline.Download
+           import androidx.media3.session.LibraryResult
+           import androidx.media3.session.MediaConstants.EXTRAS_KEY_IS_EXPLICIT
+          @@ -21,6 +22,7 @@
+           import androidx.media3.session.MediaLibraryService
+           import androidx.media3.session.MediaLibraryService.MediaLibrarySession
+           import androidx.media3.session.MediaSession
+          +import androidx.media3.session.MediaConstants
+           import androidx.media3.session.MediaSession.MediaItemsWithStartPosition
+           import androidx.media3.session.SessionCommand
+           import androidx.media3.session.SessionError
+          @@ -73,6 +75,7 @@
+           import com.metrolist.music.ui.screens.settings.serializeSections
+           import kotlinx.coroutines.withContext
+           
+          +@androidx.annotation.OptIn(UnstableApi::class)
+           class MediaLibrarySessionCallback
+           @Inject
+           constructor(
+          @@ -156,7 +159,13 @@
+                                       .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+                                       .build(),
+                               ).build(),
+          -                params,
+          +                MediaLibraryService.LibraryParams.Builder()
+          +                    .setExtras(Bundle().apply {
+          +                        // Keep the root categories and individual tracks in a list.
+          +                        putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
+          +                        putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
+          +                    })
+          +                    .build(),
+                       ),
+                   )
+           
+          @@ -909,6 +918,21 @@
+                           .setIsPlayable(false)
+                           .setIsBrowsable(true)
+                           .setMediaType(mediaType)
+          +                .apply {
+          +                    if (id == MusicService.ALBUM || id == MusicService.PLAYLIST || id == MusicService.YOUTUBE_PLAYLIST) {
+          +                        setExtras(Bundle().apply {
+          +                            // Show album/playlist thumbnails as tiles, but keep track rows readable.
+          +                            putInt(
+          +                                MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE,
+          +                                MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM,
+          +                            )
+          +                            putInt(
+          +                                MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
+          +                                MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM,
+          +                            )
+          +                        })
+          +                    }
+          +                }
+                           .build(),
+                   ).build()
+           
+          METROLIST_GRID_PATCH
+          git apply --check /tmp/metrolist-grid.patch
+          git apply /tmp/metrolist-grid.patch
+      - name: Compila APK modificato
+        env:
+          METROLIST_APPLICATION_ID: com.metrolist.music.gridtrial
+          METROLIST_APP_NAME: Metrolist Griglia
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleGmsDebug --no-daemon
+      - name: Rendi scaricabile APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Metrolist-Griglia-AndroidAuto-debug
+          path: app/build/outputs/apk/gms/debug/*.apk
+          if-no-files-found: error
