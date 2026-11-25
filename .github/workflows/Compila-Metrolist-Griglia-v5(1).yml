@@ -1,0 +1,606 @@
+name: Compila Metrolist Griglia per Android Auto V5
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Compilazione APK prova
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Scarica codice del progetto
+        uses: actions/checkout@v4
+      - name: Installa Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Configura Android SDK (senza pacchetto tools obsoleto)
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+      - name: Installa API 37 e Build Tools 36
+        shell: bash
+        run: |
+          sdkmanager --install 'platforms;android-37.0' 'build-tools;36.0.0'
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ -d "$SDK_ROOT/platforms/android-37.0" ] && [ ! -e "$SDK_ROOT/platforms/android-37" ]; then
+            ln -s android-37.0 "$SDK_ROOT/platforms/android-37"
+          fi
+      - name: Prepara Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Crea chiave di firma APK di prova
+        shell: bash
+        run: |
+          # La configurazione Gradle di Metrolist richiede questo file per i build debug.
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair \
+              -keystore "$HOME/.android/debug.keystore" \
+              -alias androiddebugkey \
+              -storepass android \
+              -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Metrolist Grid Test,C=IT" \
+              -noprompt
+          fi
+          test -s "$HOME/.android/debug.keystore"
+      - name: Applica Home, Esplora, Raccolta e ricerca
+        shell: bash
+        run: |
+          cat > /tmp/metrolist-grid.patch <<'METROLIST_GRID_PATCH'
+          --- a/app/src/main/kotlin/com/metrolist/music/playback/MediaLibrarySessionCallback.kt
+          +++ b/app/src/main/kotlin/com/metrolist/music/playback/MediaLibrarySessionCallback.kt
+          @@ -14,6 +14,8 @@
+           import androidx.media3.common.C
+           import androidx.media3.common.MediaItem
+           import androidx.media3.common.MediaMetadata
+          +import androidx.media3.common.util.UnstableApi
+          +import androidx.media3.session.MediaConstants
+           import androidx.media3.exoplayer.offline.Download
+           import androidx.media3.session.LibraryResult
+           import androidx.media3.session.MediaConstants.EXTRAS_KEY_IS_EXPLICIT
+          @@ -29,6 +31,9 @@
+           import com.google.common.util.concurrent.Futures
+           import com.google.common.util.concurrent.ListenableFuture
+           import com.metrolist.innertube.YouTube
+          +import com.metrolist.innertube.models.AlbumItem
+          +import com.metrolist.innertube.models.ArtistItem
+          +import com.metrolist.innertube.models.YTItem
+           import com.metrolist.innertube.models.PlaylistItem
+           import com.metrolist.innertube.models.SongItem
+           import com.metrolist.innertube.models.filterExplicit
+          @@ -64,7 +69,6 @@
+           import kotlinx.coroutines.plus
+           import javax.inject.Inject
+           import com.metrolist.music.constants.AndroidAutoSectionsOrderKey
+          -import com.metrolist.music.constants.AndroidAutoYouTubePlaylistsKey
+           import com.metrolist.music.constants.AutoRadioQueueKey
+           import com.metrolist.music.playback.queues.ListQueue
+           import com.metrolist.music.playback.queues.YouTubeQueue
+          @@ -72,7 +76,13 @@
+           import com.metrolist.music.ui.screens.settings.deserializeSections
+           import com.metrolist.music.ui.screens.settings.serializeSections
+           import kotlinx.coroutines.withContext
+          -
+          +import kotlinx.coroutines.withTimeoutOrNull
+          +import kotlinx.coroutines.async
+          +import kotlinx.coroutines.coroutineScope
+          +import java.time.LocalDate
+          +import java.time.DayOfWeek
+          +
+          +@androidx.annotation.OptIn(UnstableApi::class)
+           class MediaLibrarySessionCallback
+           @Inject
+           constructor(
+          @@ -156,7 +166,12 @@
+                                       .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+                                       .build(),
+                               ).build(),
+          -                params,
+          +                MediaLibraryService.LibraryParams.Builder()
+          +                    .setExtras(Bundle(params?.extras ?: Bundle()).apply {
+          +                        putBoolean("android.media.browse.SEARCH_SUPPORTED", true)
+          +                        putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
+          +                        putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
+          +                    }).build(),
+                       ),
+                   )
+           
+          @@ -189,13 +204,23 @@
+                           }
+           
+                           val children = when (parentId) {
+          -                    MusicService.ROOT -> {
+          +                    MusicService.ROOT -> listOf(
+          +                        autoFolder("auto_home", "Home", R.drawable.home_outlined),
+          +                        autoFolder("auto_explore", "Esplora", R.drawable.explore_outlined),
+          +                        autoFolder("auto_collection", "Raccolta", R.drawable.library_music),
+          +                    )
+          +                    "auto_home" -> loadAutoHome()
+          +                    "auto_explore" -> loadAutoExplore()
+          +                    "auto_recent" -> loadAutoRecent(null, 100)
+          +                    "auto_charts" -> YouTube.getChartsPage().getOrThrow().sections.flatMap {
+          +                        onlineItems(it.items, it.title, true).take(20)
+          +                    }
+          +                    "auto_collection" -> listOf(autoFolder("auto_recent", "Ascoltati di recente", R.drawable.history)) + run {
+                                   val sectionsRaw = context.dataStore.get(
+                                       AndroidAutoSectionsOrderKey,
+                                       serializeSections(AndroidAutoSection.values().map { it to true })
+                                   )
+                                   val sections = deserializeSections(sectionsRaw)
+          -                        val showYoutubePlaylists = context.dataStore.get(AndroidAutoYouTubePlaylistsKey, false)
+                                   val rootItems = sections
+                                       .filter { (_, enabled) -> enabled }
+                                       .ifEmpty { listOf(AndroidAutoSection.LIKED to true) }
+          @@ -238,29 +263,23 @@
+                                               )
+                                           }
+                                       }
+          -                        if (showYoutubePlaylists) {
+          -                            rootItems + browsableMediaItem(
+          +                        rootItems + browsableMediaItem(
+                                           MusicService.YOUTUBE_PLAYLIST,
+                                           context.getString(R.string.mixes),
+                                           null,
+                                           drawableUri(R.drawable.explore_outlined),
+                                           MediaMetadata.MEDIA_TYPE_FOLDER_PLAYLISTS,
+                                       )
+          -                        } else {
+          -                            rootItems
+          -                        }
+                               }
+                               MusicService.YOUTUBE_PLAYLIST -> {
+          -                        if (!context.dataStore.get(AndroidAutoYouTubePlaylistsKey, false)) {
+          -                            emptyList()
+          -                        } else {
+          +                        run {
+                                       try {
+                                           val allSections = mutableListOf<com.metrolist.innertube.pages.HomePage.Section>()
+                                           var continuation: String? = null
+                                           val maxPages = 4
+           
+                                           for (page in 0 until maxPages) {
+          -                                    val result = YouTube.home(continuation)
+          +                                    val result = YouTube.home(continuation, authenticated = true)
+                                                   .onFailure { reportException(it) }
+                                                   .getOrNull() ?: break
+                                               allSections.addAll(result.sections)
+          @@ -347,6 +366,21 @@
+                                           }
+                                       }
+           
+          +                            parentId.startsWith("auto_album/") -> {
+          +                                val albumId = parentId.substringAfter('/')
+          +                                onlineItems(YouTube.album(albumId).getOrThrow().songs, null, false)
+          +                            }
+          +                            parentId.startsWith("auto_artist/") -> {
+          +                                val artistId = parentId.substringAfter('/')
+          +                                YouTube.artist(artistId).getOrThrow().sections.flatMap { section ->
+          +                                    onlineItems(section.items, section.title, true)
+          +                                }
+          +                            }
+          +                            parentId.startsWith("auto_genre/") -> {
+          +                                val id = parentId.split("/", limit = 3)
+          +                                YouTube.browse(Uri.decode(id[1]), id.getOrNull(2)?.let(Uri::decode)?.takeIf { it.isNotEmpty() })
+          +                                    .getOrThrow().items.flatMap { onlineItems(it.items, it.title, true) }
+          +                            }
+                                       else -> emptyList()
+                                   }
+                           }
+          @@ -523,6 +557,101 @@
+                   }
+               }
+           
+          +    private val searchCache = object : android.util.LruCache<String, List<MediaItem>>(12) {}
+          +    private val trackCache = object : android.util.LruCache<String, MediaItem>(1500) {}
+          +
+          +    private fun autoFolder(id: String, title: String, icon: Int) =
+          +        browsableMediaItem(id, title, null, drawableUri(icon), MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+          +
+          +    private fun styled(item: MediaItem, group: String?, grid: Boolean): MediaItem {
+          +        val extras = Bundle(item.mediaMetadata.extras ?: Bundle()).apply {
+          +            if (group != null) putString(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_GROUP_TITLE, group)
+          +            if (grid) {
+          +                putInt("android.media.browse.CONTENT_STYLE_SINGLE_ITEM_HINT", MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM)
+          +            }
+          +        }
+          +        return item.buildUpon().setMediaMetadata(item.mediaMetadata.buildUpon().setExtras(extras).build()).build()
+          +    }
+          +
+          +    private fun autoTrack(item: MediaItem, group: String?, grid: Boolean): MediaItem {
+          +        trackCache.put(item.mediaId, item)
+          +        return styled(item.buildUpon().setMediaId("auto_track/${item.mediaId}").build(), group, grid)
+          +    }
+          +
+          +    private fun onlineItems(items: List<YTItem>, group: String?, grid: Boolean): List<MediaItem> =
+          +        items.filterExplicit(context.dataStore.get(HideExplicitKey, false))
+          +            .filterVideoSongs(context.dataStore.get(HideVideoSongsKey, false))
+          +            .distinctBy { it.id }.mapNotNull { item ->
+          +                when (item) {
+          +                    is SongItem -> autoTrack(item.toMediaItem(), group, grid)
+          +                    is AlbumItem -> styled(browsableMediaItem("auto_album/${item.browseId}", item.title,
+          +                        item.artists?.joinToString { it.name }, item.thumbnail.toUri(), MediaMetadata.MEDIA_TYPE_ALBUM), group, grid)
+          +                    is ArtistItem -> styled(browsableMediaItem("auto_artist/${item.id}", item.title,
+          +                        null, item.thumbnail?.toUri(), MediaMetadata.MEDIA_TYPE_ARTIST), group, grid)
+          +                    is PlaylistItem -> styled(browsableMediaItem("${MusicService.YOUTUBE_PLAYLIST}/${item.id}", item.title,
+          +                        item.author?.name, item.thumbnail?.toUri(), MediaMetadata.MEDIA_TYPE_PLAYLIST), group, grid)
+          +                    else -> null
+          +                }
+          +            }
+          +
+          +    private suspend fun loadAutoRecent(group: String?, limit: Int): List<MediaItem> {
+          +        val today = LocalDate.now()
+          +        val monday = today.with(DayOfWeek.MONDAY)
+          +        val local = database.historyEvents(today.plusDays(1).atStartOfDay(), today.atStartOfDay(),
+          +            today.minusDays(1).atStartOfDay(), monday.atStartOfDay(), monday.minusWeeks(1).atStartOfDay())
+          +            .first().map { it.song }.distinctBy { it.id }.take(limit)
+          +            .filter { !context.dataStore.get(HideExplicitKey, false) || !it.song.explicit }
+          +            .filter { !context.dataStore.get(HideVideoSongsKey, false) || !it.song.isVideo }
+          +            .map { autoTrack(it.toMediaItem(), group, true) }
+          +        val remote = if (!YouTube.cookie.isNullOrBlank()) withTimeoutOrNull(8000) {
+          +            YouTube.musicHistory().onFailure { reportException(it) }.getOrNull()?.sections.orEmpty()
+          +                .flatMap { it.songs }.distinctBy { it.id }.take(limit)
+          +        }.orEmpty() else emptyList()
+          +        // Preserve YouTube's ordering; append local-only entries (remote timestamps are not available).
+          +        return (onlineItems(remote, group, true) + local).distinctBy { it.mediaId }.take(limit)
+          +    }
+          +
+          +    private suspend fun loadAutoHome(): List<MediaItem> = coroutineScope {
+          +        val recent = async { loadAutoRecent("Ascoltati di recente", 12) }
+          +        val home = async { withTimeoutOrNull(9000) { YouTube.home(authenticated = true).onFailure { reportException(it) }.getOrNull() } }
+          +        val releases = async { withTimeoutOrNull(8000) { YouTube.explore().onFailure { reportException(it) }.getOrNull() } }
+          +        val favorites = database.forgottenFavorites().first().take(10)
+          +            .filter { !context.dataStore.get(HideExplicitKey, false) || !it.song.explicit }
+          +            .filter { !context.dataStore.get(HideVideoSongsKey, false) || !it.song.isVideo }
+          +            .map { autoTrack(it.toMediaItem(), "Preferiti da riascoltare", true) }
+          +        recent.await() + home.await()?.sections.orEmpty().take(6).flatMap { section ->
+          +            onlineItems(section.items, section.title, true).take(10)
+          +        } + favorites + onlineItems(releases.await()?.newReleaseAlbums.orEmpty(), "Nuove uscite", true).take(12)
+          +    }
+          +
+          +    private suspend fun loadAutoExplore(): List<MediaItem> {
+          +        val page = YouTube.explore().getOrThrow()
+          +        val genres = page.moodAndGenres.take(30).map { genre ->
+          +            styled(autoFolder("auto_genre/${Uri.encode(genre.endpoint.browseId)}/${Uri.encode(genre.endpoint.params.orEmpty())}",
+          +                genre.title, R.drawable.explore_outlined), "Generi e stati d'animo", false)
+          +        }
+          +        return listOf(autoFolder("auto_charts", "Classifiche", R.drawable.music_note)) +
+          +            onlineItems(page.newReleaseAlbums, "Nuove uscite", true).take(30) + genres
+          +    }
+          +
+          +    private suspend fun loadAutoSearch(query: String): List<MediaItem> = coroutineScope {
+          +        val online = async { withTimeoutOrNull(9000) {
+          +            YouTube.search(query, YouTube.SearchFilter.FILTER_SONG).onFailure { reportException(it) }.getOrNull()
+          +        } }
+          +        val summary = async { withTimeoutOrNull(9000) {
+          +            YouTube.searchSummary(query).onFailure { reportException(it) }.getOrNull()
+          +        } }
+          +        val local = database.searchSongsExtended(query, context.dataStore.get(AndroidAutoSearchLocalLimitKey, 75)).first()
+          +            .filter { !context.dataStore.get(HideExplicitKey, false) || !it.song.explicit }
+          +            .filter { !context.dataStore.get(HideVideoSongsKey, false) || !it.song.isVideo }
+          +            .map { autoTrack(it.toMediaItem(), "Dalla raccolta", false) }
+          +        val songs = onlineItems(online.await()?.items.orEmpty(), "Brani online", false)
+          +        val sections = summary.await()?.summaries.orEmpty().flatMap { section ->
+          +            onlineItems(section.items, section.title, false)
+          +        }
+          +        (songs + sections + local).distinctBy { it.mediaId }.take(100)
+          +    }
+          +
+               override fun onGetItem(
+                   session: MediaLibrarySession,
+                   browser: MediaSession.ControllerInfo,
+          @@ -530,8 +659,10 @@
+               ): ListenableFuture<LibraryResult<MediaItem>> =
+                   scope.future(Dispatchers.IO) {
+                       try {
+          -                database.song(mediaId).first()?.toMediaItem()?.let {
+          -                    LibraryResult.ofItem(it, null)
+          +                val rawId = mediaId.removePrefix("auto_track/")
+          +                val item = trackCache.get(rawId) ?: database.song(rawId).first()?.toMediaItem()
+          +                item?.let {
+          +                    LibraryResult.ofItem(it.buildUpon().setMediaId(mediaId).build(), null)
+                           } ?: LibraryResult.ofError(SessionError.ERROR_UNKNOWN)
+                       } catch (e: Exception) {
+                           reportException(e)
+          @@ -544,9 +675,13 @@
+                   browser: MediaSession.ControllerInfo,
+                   query: String,
+                   params: MediaLibraryService.LibraryParams?
+          -    ): ListenableFuture<LibraryResult<Void>> {
+          -        session.notifySearchResultChanged(browser, query, 1, params)
+          -        return Futures.immediateFuture(LibraryResult.ofVoid())
+          +    ): ListenableFuture<LibraryResult<Void>> = scope.future {
+          +        val results = if (query.isBlank()) emptyList() else withContext(Dispatchers.IO) {
+          +            try { loadAutoSearch(query) } catch (e: Exception) { reportException(e); emptyList() }
+          +        }
+          +        searchCache.put(query, results)
+          +        session.notifySearchResultChanged(browser, query, results.size, params)
+          +        LibraryResult.ofVoid(params)
+               }
+           
+               override fun onGetSearchResult(
+          @@ -556,84 +691,14 @@
+                   page: Int,
+                   pageSize: Int,
+                   params: MediaLibraryService.LibraryParams?
+          -    ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+          -        return scope.future(Dispatchers.IO) {
+          -            if (query.isEmpty()) {
+          -                return@future LibraryResult.ofItemList(emptyList(), params)
+          -            }
+          -
+          -            try {
+          -                val searchResults = mutableListOf<MediaItem>()
+          -                val limit = context.dataStore.get(AndroidAutoSearchLocalLimitKey, 75)
+          -
+          -                val allLocalSongs = database.searchSongsExtended(query, limit).first()
+          -                allLocalSongs.forEach { song ->
+          -                    searchResults.add(song.toMediaItem(
+          -                        path = "${MusicService.SEARCH}/$query",
+          -                        isPlayable = true,
+          -                        isBrowsable = false,
+          -                    ))
+          -                }
+          -
+          -                try {
+          -                    val onlineResults = YouTube.search(query, YouTube.SearchFilter.FILTER_SONG)
+          -                        .getOrNull()
+          -                        ?.items
+          -                        ?.filterIsInstance<SongItem>()
+          -                        ?.filterExplicit(context.dataStore.get(HideExplicitKey, false))
+          -                        ?.filterVideoSongs(context.dataStore.get(HideVideoSongsKey, false))
+          -                        ?.filter { onlineSong ->
+          -                            !allLocalSongs.any { localSong ->
+          -                                localSong.id == onlineSong.id ||
+          -                                (localSong.song.title.equals(onlineSong.title, ignoreCase = true) &&
+          -                                 localSong.artists.any { artist ->
+          -                                     onlineSong.artists.any {
+          -                                         it.name.equals(artist.name, ignoreCase = true)
+          -                                     }
+          -                                 })
+          -                            }
+          -                        } ?: emptyList()
+          -
+          -                    onlineResults.forEach { songItem ->
+          -                        try {
+          -                            database.query { insert(songItem.toMediaMetadata()) }
+          -                        } catch (e: Exception) {
+          -                        }
+          -                        
+          -                        searchResults.add(
+          -                            MediaItem.Builder()
+          -                                .setMediaId("${MusicService.SEARCH}/$query/${songItem.id}")
+          -                                .setMediaMetadata(
+          -                                    MediaMetadata.Builder()
+          -                                        .setTitle(songItem.title)
+          -                                        .setExtras(Bundle().apply {
+          -                                            if (songItem.explicit) putLong(EXTRAS_KEY_IS_EXPLICIT, EXTRAS_VALUE_ATTRIBUTE_PRESENT)
+          -                                        })
+          -                                        .setSubtitle(songItem.artists.joinToArtistString(getArtistSeparator(context)) {
+          -                                            ArtistNameAliases.resolve(it.id, it.name)
+          -                                        })
+          -                                        .setArtist(songItem.artists.joinToArtistString(getArtistSeparator(context)) {
+          -                                            ArtistNameAliases.resolve(it.id, it.name)
+          -                                        })
+          -                                        .setArtworkUri(songItem.thumbnail.toUri())
+          -                                        .setIsPlayable(true)
+          -                                        .setIsBrowsable(false)
+          -                                        .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+          -                                        .build()
+          -                                )
+          -                                .build()
+          -                        )
+          -                    }
+          -                } catch (e: Exception) {
+          -                    reportException(e)
+          -                }
+          -                
+          -                LibraryResult.ofItemList(searchResults, params)
+          -                
+          -            } catch (e: Exception) {
+          -                reportException(e)
+          -                LibraryResult.ofItemList(emptyList(), params)
+          -            }
+          +    ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = scope.future(Dispatchers.IO) {
+          +        try {
+          +            val results = if (query.isBlank()) emptyList() else searchCache.get(query)
+          +                ?: loadAutoSearch(query).also { searchCache.put(query, it) }
+          +            LibraryResult.ofItemList(results.paginate(page.coerceAtLeast(0), pageSize.coerceAtLeast(0)), params)
+          +        } catch (e: Exception) {
+          +            reportException(e)
+          +            LibraryResult.ofItemList(emptyList(), params)
+                   }
+               }
+           
+          @@ -655,6 +720,27 @@
+                       } ?: return@future defaultResult
+           
+                       when (path.firstOrNull()) {
+          +                "auto_track" -> {
+          +                    val id = path.getOrNull(1) ?: return@future defaultResult
+          +                    val track = trackCache.get(id) ?: database.song(id).first()?.toMediaItem()
+          +                        ?: return@future defaultResult
+          +                    val metadata = track.localConfiguration?.tag as? com.metrolist.music.models.MediaMetadata
+          +                    if (metadata != null) database.withTransaction { insert(metadata) }
+          +                    val radio = if (metadata != null && context.dataStore.get(AutoRadioQueueKey, true)) {
+          +                        val queue = YouTubeQueue.radio(metadata)
+          +                        val status = withTimeoutOrNull(8000) { runCatching { queue.getInitialStatus() }.getOrNull() }
+          +                            ?.filterExplicit(context.dataStore.get(HideExplicitKey, false))
+          +                            ?.filterVideoSongs(context.dataStore.get(HideVideoSongsKey, false))
+          +                        if (status != null && status.items.any { it.mediaId == id }) {
+          +                            withContext(Dispatchers.Main) { service.adoptQueue(queue, status.title, status.items.size) }
+          +                            MediaItemsWithStartPosition(status.items, status.items.indexOfFirst { it.mediaId == id }, C.TIME_UNSET)
+          +                        } else null
+          +                    } else null
+          +                    radio ?: run {
+          +                        withContext(Dispatchers.Main) { service.adoptQueue(ListQueue(items = listOf(track))) }
+          +                        MediaItemsWithStartPosition(listOf(track), 0, startPositionMs)
+          +                    }
+          +                }
+                           MusicService.SONG -> {
+                               val songId = path.getOrNull(1) ?: return@future defaultResult
+                               val allSongs = database.songsByCreateDateAsc().first()
+          @@ -786,6 +872,8 @@
+                               val limit = context.dataStore.get(AndroidAutoSearchLocalLimitKey, 75)
+           
+                               val allLocalSongs = database.searchSongsExtended(searchQuery, limit).first()
+          +                        .filter { !context.dataStore.get(HideExplicitKey, false) || !it.song.explicit }
+          +                        .filter { !context.dataStore.get(HideVideoSongsKey, false) || !it.song.isVideo }
+                               searchResults.addAll(allLocalSongs)
+                               if (!isVoiceSearch && songId.isNotBlank() && searchResults.indexOfFirst { it.id == songId } == -1) {
+                                   database.song(songId).first()?.let { searchResults.add(it) }
+          @@ -793,7 +881,7 @@
+                               
+                               try {
+                                   val onlineResults = YouTube.search(searchQuery, YouTube.SearchFilter.FILTER_SONG)
+          -                            .getOrNull()
+          +                            .onFailure { reportException(it) }.getOrNull()
+                                       ?.items
+                                       ?.filterIsInstance<SongItem>()
+                                       ?.filterExplicit(context.dataStore.get(HideExplicitKey, false))
+          @@ -812,7 +900,7 @@
+           
+                                   onlineResults.forEach { songItem ->
+                                       try {
+          -                                database.query { insert(songItem.toMediaMetadata()) }
+          +                                database.withTransaction { insert(songItem.toMediaMetadata()) }
+                                           database.song(songItem.id).first()?.let { newSong ->
+                                               searchResults.add(newSong)
+                                           }
+          @@ -832,6 +920,9 @@
+                                       val snapshot: List<Song> =
+                                           synchronized(searchResults) { searchResults.toList() }
+                                       VoiceSearchMatcher.findBest(searchQuery, snapshot)
+          +                                ?: snapshot.firstOrNull { song ->
+          +                                    song.artists.any { it.name.equals(searchQuery.trim(), ignoreCase = true) }
+          +                                }
+                                   } else {
+                                       searchResults.firstOrNull { it.id == songId }
+                                   }
+          @@ -909,6 +1000,17 @@
+                           .setIsPlayable(false)
+                           .setIsBrowsable(true)
+                           .setMediaType(mediaType)
+          +                .apply {
+          +                    if (id in listOf(MusicService.ALBUM, MusicService.PLAYLIST, MusicService.YOUTUBE_PLAYLIST,
+          +                            "auto_home", "auto_explore", "auto_recent")) {
+          +                        setExtras(Bundle().apply {
+          +                            putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM)
+          +                            putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
+          +                                if (id == "auto_home" || id == "auto_recent") MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM
+          +                                else MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
+          +                        })
+          +                    }
+          +                }
+                           .build(),
+                   ).build()
+           
+          @@ -939,7 +1041,9 @@
+           }
+           
+           internal fun isBrowsableMediaId(mediaId: String): Boolean =
+          -    mediaId == MusicService.ROOT ||
+          +    mediaId in listOf("auto_home", "auto_explore", "auto_collection", "auto_recent", "auto_charts") ||
+          +        mediaId.startsWith("auto_album/") || mediaId.startsWith("auto_artist/") || mediaId.startsWith("auto_genre/") ||
+          +        mediaId == MusicService.ROOT ||
+                   mediaId == MusicService.SONG ||
+                   mediaId == MusicService.ARTIST ||
+                   mediaId == MusicService.ALBUM ||
+          --- a/innertube/src/main/kotlin/com/metrolist/innertube/YouTube.kt
+          +++ b/innertube/src/main/kotlin/com/metrolist/innertube/YouTube.kt
+          @@ -1533,14 +1533,15 @@
+               suspend fun home(
+                   continuation: String? = null,
+                   params: String? = null,
+          +        authenticated: Boolean = false,
+               ): Result<HomePage> =
+                   runCatching {
+                       Timber.d("home() called with continuation=$continuation, params=$params")
+                       if (continuation != null) {
+          -                return@runCatching homeContinuation(continuation).getOrThrow()
+          +                return@runCatching homeContinuation(continuation, authenticated).getOrThrow()
+                       }
+           
+          -            val response = innerTube.browse(WEB_REMIX, browseId = "FEmusic_home", params = params).body<BrowseResponse>()
+          +            val response = innerTube.browse(WEB_REMIX, browseId = "FEmusic_home", params = params, setLogin = authenticated && !cookie.isNullOrBlank()).body<BrowseResponse>()
+                       Timber.d("home() response received")
+                       val continuation =
+                           response.contents
+          @@ -1579,10 +1580,10 @@
+                       HomePage(chips, sections, continuation)
+                   }
+           
+          -    private suspend fun homeContinuation(continuation: String): Result<HomePage> =
+          +    private suspend fun homeContinuation(continuation: String, authenticated: Boolean = false): Result<HomePage> =
+                   runCatching {
+                       val response =
+          -                innerTube.browse(WEB_REMIX, continuation = continuation).body<BrowseResponse>()
+          +                innerTube.browse(WEB_REMIX, continuation = continuation, setLogin = authenticated && !cookie.isNullOrBlank()).body<BrowseResponse>()
+                       val continuation =
+                           response.continuationContents
+                               ?.sectionListContinuation
+          --- a/app/src/main/kotlin/com/metrolist/music/playback/MusicService.kt
+          +++ b/app/src/main/kotlin/com/metrolist/music/playback/MusicService.kt
+          @@ -4068,7 +4068,9 @@
+                       }
+                   }
+           
+          -        if (playbackStats.totalPlayTimeMs >= historyDurationMs) {
+          +        if (playbackStats.totalPlayTimeMs >= historyDurationMs &&
+          +            !dataStore.get(PauseListenHistoryKey, false)
+          +        ) {
+                       scope.launch(Dispatchers.IO) {
+                           val playbackUrl =
+                               playbackUrlCache[cacheKey(mediaItem.mediaId)]
+          METROLIST_GRID_PATCH
+          if git apply --check /tmp/metrolist-grid.patch; then
+            git apply /tmp/metrolist-grid.patch
+          elif git apply --reverse --check /tmp/metrolist-grid.patch; then
+            echo 'V4 already applied'
+          else
+            echo 'Source version differs from the October 12 archive' >&2
+            exit 1
+          fi
+      - name: Correggi ricerca Android Auto V5
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          p = Path('app/src/main/kotlin/com/metrolist/music/playback/MediaLibrarySessionCallback.kt')
+          s = p.read_text()
+          start = s.index('    override fun onSearch(')
+          end = s.index('    override fun onGetSearchResult(', start)
+          s = s[:start] + """    override fun onSearch(
+                  session: MediaLibrarySession,
+                  browser: MediaSession.ControllerInfo,
+                  query: String,
+                  params: MediaLibraryService.LibraryParams?
+              ): ListenableFuture<LibraryResult<Void>> {
+                  session.notifySearchResultChanged(browser, query, if (query.isBlank()) 0 else 1, params)
+                  return Futures.immediateFuture(LibraryResult.ofVoid())
+              }
+
+          """ + s[end:]
+          old = 'results.paginate(page.coerceAtLeast(0), pageSize.coerceAtLeast(0))'
+          assert old in s
+          s = s.replace(old, 'results.paginate(page.coerceAtLeast(0), if (pageSize <= 0) 100 else pageSize)')
+          p.write_text(s)
+          PYTHON
+      - name: Compila APK modificato
+        env:
+          METROLIST_APPLICATION_ID: com.metrolist.music.gridtrial.v5
+          METROLIST_APP_NAME: Metrolist Griglia V5
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleGmsDebug --no-daemon
+      - name: Rendi scaricabile APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Metrolist-Griglia-V5-AndroidAuto-debug
+          path: app/build/outputs/apk/gms/debug/*.apk
+          if-no-files-found: error
